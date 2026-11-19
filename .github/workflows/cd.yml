@@ -1,0 +1,153 @@
+name: CD - Despliegue Continuo
+
+on:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: 1. Ejecutar Pruebas
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar pruebas
+        run: npm test
+
+  build-and-push:
+    name: 2. Construir y Publicar Imagen Docker
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.prep.outputs.tag }}
+      image_name: ${{ steps.prep.outputs.image }}
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar nombres y tags
+        id: prep
+        run: |
+          IMAGE_NAME="ghcr.io/${{ github.repository }}"
+          IMAGE_NAME=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          TAG="${{ github.sha }}"
+          echo "image=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Iniciar sesión en GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Construir y publicar imagen
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.prep.outputs.image }}:${{ steps.prep.outputs.tag }}
+            ${{ steps.prep.outputs.image }}:latest
+
+  deploy:
+    name: 3. Despliegue Seguro en Amazon EC2 con Verificación y Rollback
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Desplegar en EC2 vía SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE_NAME: ${{ needs.build-and-push.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE_NAME,IMAGE_TAG,GITHUB_ACTOR,GHCR_TOKEN
+          script_stop: true
+          script: |
+            echo "=== INICIANDO DESPLIEGUE EN EC2 ==="
+            
+            # Autenticarse en GHCR en la instancia EC2
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+            # Descargar la nueva imagen
+            echo "Descargando imagen: $IMAGE_NAME:$IMAGE_TAG"
+            docker pull "$IMAGE_NAME:$IMAGE_TAG"
+
+            # Guardar la imagen previa para posible rollback
+            PREVIOUS_CONTAINER=$(docker ps -q --filter "name=api-libros")
+            if [ -n "$PREVIOUS_CONTAINER" ]; then
+              PREVIOUS_IMAGE=$(docker inspect --format='{{.Config.Image}}' "$PREVIOUS_CONTAINER")
+              echo "Imagen previa en ejecución: $PREVIOUS_IMAGE"
+            else
+              PREVIOUS_IMAGE=""
+              echo "No hay contenedor previo en ejecucion."
+            fi
+
+            # Detener y remover el contenedor anterior
+            echo "Deteniendo contenedor actual (si existe)..."
+            docker stop api-libros || true
+            docker rm api-libros || true
+
+            # Levantar el nuevo contenedor en el puerto 3000 local (solo accesible vía Nginx)
+            echo "Iniciando nuevo contenedor..."
+            docker run -d \
+              --name api-libros \
+              -p 127.0.0.1:3000:3000 \
+              --env-file /home/ubuntu/.env \
+              --restart unless-stopped \
+              "$IMAGE_NAME:$IMAGE_TAG"
+
+            # Esperar inicialización
+            echo "Esperando 8 segundos para inicialización..."
+            sleep 8
+
+            # Paso de Verificación (Healthcheck y consulta a /libros)
+            echo "Verificando salud del servicio desplegado (/health)..."
+            HEALTH_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/health || echo "000")
+            
+            echo "Verificando endpoint /libros..."
+            LIBROS_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/libros || echo "000")
+
+            echo "Resultado verificación: /health = $HEALTH_HTTP_CODE | /libros = $LIBROS_HTTP_CODE"
+
+            if [ "$HEALTH_HTTP_CODE" -eq 200 ] && [ "$LIBROS_HTTP_CODE" -eq 200 ]; then
+              echo "✅ Despliegue verificado exitosamente."
+              docker image prune -f
+            else
+              echo "❌ Error: La verificación falló."
+              if [ -n "$PREVIOUS_IMAGE" ]; then
+                echo "⚠️ Iniciando ROLLBACK a la versión previa: $PREVIOUS_IMAGE..."
+                docker stop api-libros || true
+                docker rm api-libros || true
+                docker run -d \
+                  --name api-libros \
+                  -p 127.0.0.1:3000:3000 \
+                  --env-file /home/ubuntu/.env \
+                  --restart unless-stopped \
+                  "$PREVIOUS_IMAGE"
+                echo "Rollback completado."
+              fi
+              exit 1
+            fi
